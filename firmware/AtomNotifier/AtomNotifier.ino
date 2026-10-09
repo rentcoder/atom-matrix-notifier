@@ -46,6 +46,13 @@ int nextPending(int after) {
   return -1;
 }
 
+void previewPending(uint32_t now) {
+  if (shown < 0 || !pending[shown]) shown = nextPending(-1);
+  lastCycle = now;
+  displayUntil = shown >= 0 ? now + DISPLAY_MS : 0;
+  sleepDeadline = now + RECEIVE_WINDOW_MS;
+}
+
 void command(const char* line) {
   if (strcmp(line, "PING") == 0) {
     lastHeartbeat = millis();
@@ -113,12 +120,18 @@ void readButton(uint32_t now) {
   if (pressed != rawButton) { rawButton = pressed; buttonChange = now; }
   if ((uint32_t)(now - buttonChange) >= 30 && rawButton != stableButton) {
     stableButton = rawButton;
-    if (stableButton) { buttonDown = now; longHandled = false; }
+    if (stableButton) {
+      buttonDown = now;
+      longHandled = false;
+      // A dark panel means preview, even during an awake Bluetooth window.
+      previewWake = shown < 0 || (int32_t)(displayUntil - now) <= 0;
+      if (previewWake) previewPending(now);
+    }
     else if (!longHandled && shown >= 0) {
       if (previewWake) {
         previewWake = false;
         displayUntil = now + DISPLAY_MS;
-        sleepDeadline = displayUntil + 200;
+        // Leave the receive window open for the PC to synchronize held items.
         return;
       }
       // Confirmation remains local; no unsolicited messages on the command link.
@@ -191,10 +204,13 @@ void setup() {
   SerialBT.enableSSP(false, false);
   if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0) {
     // The wake press previews retained items; a subsequent press acknowledges.
-    displayUntil = millis() + DISPLAY_MS;
     rawButton = stableButton = true;
     previewWake = true;
     buttonDown = millis();
+    previewPending(buttonDown);
+    // Show RTC-retained notifications before synchronous Bluetooth startup.
+    lastFrame = buttonDown - 40;
+    paint(buttonDown);
   }
   if (!SerialBT.begin("ATOM-Notify", false, true)) {
     Serial.println("Bluetooth startup failed");
@@ -204,6 +220,7 @@ void setup() {
       getCpuFrequencyMhz(), modemSleepEnabled, (unsigned long)wakeCount);
   }
   sleepDeadline = millis() + RECEIVE_WINDOW_MS;
+  if (previewWake) previewPending(millis());
 }
 
 void loop() {
