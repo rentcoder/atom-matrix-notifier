@@ -4,34 +4,37 @@ using System.Linq;
 
 namespace AtomNotifier;
 
-// Track notification identities so removing one toast cannot clear another.
+public readonly record struct ClearRequest(int Mask, long Revision);
+
+// Windows toasts trigger delivery; badge absence or explicit acknowledgement clears retention.
 public sealed class NotificationState {
     public static readonly string[] Channels = { "CHAT", "CODEX", "DOTS" };
-    Dictionary<string, string> active = new();
+    Dictionary<string, string> previous = new();
     readonly Dictionary<string, string> queued = new();
-    readonly HashSet<string> acknowledged = new();
     bool initialized;
+    long clearRevision;
+    public int ClearMask { get; private set; }
 
     public string[] Observe(Dictionary<string, string> snapshot) {
         var added = new List<string>();
-        foreach (string key in queued.Keys.ToArray())
-            if (!snapshot.TryGetValue(key, out string? channel) || queued[key] != channel)
-                queued.Remove(key);
-        acknowledged.RemoveWhere(key => !snapshot.ContainsKey(key));
         if (initialized)
             foreach (var item in snapshot)
-                if (!active.TryGetValue(item.Key, out string? previous) || previous != item.Value) {
+                if (!previous.TryGetValue(item.Key, out string? channel) || channel != item.Value) {
                     queued[item.Key] = item.Value;
                     added.Add(item.Key);
                 }
-        active = new Dictionary<string, string>(snapshot);
+        // Removing a toast does not mean the badge/read state changed.
+        previous = new Dictionary<string, string>(snapshot);
         initialized = true;
         return added.ToArray();
     }
 
     public string[] QueuedChannels => queued.Values.Distinct().ToArray();
-    public int ClearMask => Channels.Select((channel, index) =>
-        active.Any(item => item.Value == channel && !acknowledged.Contains(item.Key)) ? 0 : 1 << index).Sum();
+    public ClearRequest CaptureClear() => new(ClearMask, clearRevision);
+    public void ConfirmClear(ClearRequest request) {
+        // Preserve any newer acknowledgement received during a Bluetooth await.
+        if (request.Revision == clearRevision) ClearMask &= ~request.Mask;
+    }
 
     public void MarkSent(string channel) {
         foreach (string key in queued.Where(item => item.Value == channel).Select(item => item.Key).ToArray())
@@ -39,10 +42,10 @@ public sealed class NotificationState {
     }
 
     public bool DismissChannel(string channel) {
-        bool changed = false;
-        foreach (var item in active.Where(item => item.Value == channel))
-            changed |= acknowledged.Add(item.Key);
+        int bit = 1 << Array.IndexOf(Channels, channel);
+        bool changed = (ClearMask & bit) == 0 || queued.Values.Contains(channel);
         MarkSent(channel);
+        if (changed) { ClearMask |= bit; clearRevision++; }
         return changed;
     }
 }

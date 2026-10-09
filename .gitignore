@@ -8,3 +8,4 @@
 *.zip
 /settings.json
 /status.json
+/badge-reader.json

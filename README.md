@@ -73,19 +73,27 @@ Windows起動時に自動起動するには、`Win+R` → `shell:startup` を開
 
 同じ種類の通知はまとめます。Windows通知そのものは削除しません。
 
-## PCでの確認済み同期（v1.4）
+## バッジによる保持の消去（v1.5）
 
-Windows版ChatGPTアプリを前面にすると、**Chatの保持をすべて確認済み**にします。会話ごとの既読判定ではないため、別の会話のChat通知も消えます。Codex・Dotsの保持はこの前面検出では消しません。
+通知を受け取るきっかけは**Windows通知センターの新着通知**です。保持を消す判断には、**ChatGPT／Codexのタスクバーアイコンに付く未読バッジの有無**を使います。
 
-ChatGPT内の既読状態を直接取得しているわけではありません。Windowsの前面ウィンドウが `ChatGPT` プロセスに属することを判定し、確認済みの代わりに使います。前面にしている間に届いたChat通知も確認済みになります。
+- バッジあり：ATOMの未確認状態を保持します。前面にしただけでは消しません。
+- バッジなし：連続3回・2秒以上の確認後、Chat・Codex・Dotsの保持をすべて消します。通常の2秒間隔の監視では約4秒で確定します。
+- 読み取り失敗、ロック画面、アイコン非表示、対象アプリ未起動、複数対象で判別不能：自動消去を保留します。
 
-ブラウザー版ChatGPTの前面表示はこの検出の対象外です。
+バッジの内訳は使いません。Windows通知センターから通知を削除しても、その理由だけでATOMの保持や送信待ちを消しません。新着通知から3秒間は、バッジの表示が遅れる場合に備えて自動消去を待ちます。バッジが消えた時点で送信待ちの通知も確認済みにします。既存のWindows通知が残っていても、それだけで再通知しません。
 
-Windows通知センターから消えた通知も追跡します。同じ種類の未確認通知がほかに残っている場合は、その種類の保持を消しません。送信待ちの間に確認・削除した通知は転送しません。Windows通知センターに残っていても、PCで確認済みとした既存通知から再点灯することはありません。新しい通知が届くと再び対象になります。
+ATOMが眠っている場合、消去指示をPCで保持し、次の起床時に反映します。`CLEAR 7` で3種類をまとめて消します。ATOMのボタンで確認済みにした状態も、既存通知から勝手に復活しません。
 
-ATOMが眠っている間の変更は次の起床時に反映します。通知領域の右クリック→「Chatを確認済みにする」「すべて確認済みにする」からも消去できます。Windows通知そのものを削除する操作は行いません。
+バッジはExplorerが公開するアクセシビリティ説明（例：`未読のお知らせ 1 件`）から読み取ります。画像認識やChatGPT内部の既読APIは使用しません。対象アプリを自動選択し、状態を設定画面に表示します。このPCでは統合アプリの `OpenAI.Codex` タスクバーボタンを確認しています。
 
-更新時はWindowsブリッジとATOMの両方を更新してください。v1.4のプロトコルは `CLEAR <mask>`（Chat=1、Codex=2、Dots=4）で指定した種類だけを消去します。PCから未確認フラグを毎回上書きしないため、ATOMのボタンで確認済みにした状態も勝手に復活しません。
+初めて使う環境では、対象アプリのバッジを一度実際に取得するまで、空の説明を「バッジなし」と断定しません。読み取り実績はアプリデータ領域の `badge-reader.json` に保存します。Windowsのタスクバーバッジ設定を無効にしている場合も自動消去しません。
+
+ChatGPTとCodexなど対象が複数あり選べない場合は、ブリッジ終了中にアプリデータ領域の `settings.json` の `BadgeAppId` へ対象のAppUserModelIDを指定できます。空欄は自動選択です。ブラウザー版のタブ内やアドレスバー内のバッジは対象外です。
+
+トレイの「Chatを確認済みにする」「すべて確認済みにする」とATOMのボタンは、明示的な確認操作として引き続き利用できます。Windows通知そのものは削除しません。
+
+v1.4のファームウェアを使用中なら、v1.5への更新はWindowsブリッジだけで対応できます。それ以前のファームウェアではATOMも更新してください。プロトコルは `CLEAR <mask>`（Chat=1、Codex=2、Dots=4）です。
 
 ## 通知の分類とデータ
 
@@ -105,7 +113,7 @@ PC側の未送信キューはメモリー上で保持します。ブリッジを
 
 実機ESP32-PICO-D4への書き込みとBluetooth通信、CPU80MHz・Modem Sleep有効、Deep Sleep復帰回数の増加、スリープをまたぐ3種類の未確認状態保持、PC側キューからの3種類の転送・受領確認を検証しました。
 
-v1.4ではWindows版ChatGPTの実際の前面検出と、次の同期でChatだけを消去してCodex・Dotsを保持する動作を実機の応答で確認しました。
+v1.5では実際の対象アプリのバッジありの読取と、バッジありの間にATOMの保持を維持する通信を確認しました。検証用アプリを使い、実際のExplorerでバッジ表示→消失の読取と読取実績の再読み込みも確認しています。実際の対象バッジが自然に消えたあと、消去命令が送られATOMの保持がPENDING2からPENDING0になったことも確認しました。検証のためにChatGPTの画面や通知を操作してはいません。
 
 物理LEDの見え方、ボタンによる復帰・確認操作、個別の実際のChat・Codex・Dot通知はこの検証では直接観察していません。
 
@@ -115,7 +123,13 @@ v1.4ではWindows版ChatGPTの実際の前面検出と、次の同期でChatだ�
 dotnet run --project tests/NotificationState.Tests -c Release
 ```
 
-初回通知の扱い、同一種類の一部削除、前面相当の確認済み処理、残存通知による復活防止、新着通知による再開、スリープ中の送信待ち取り消しなど10項目を検証します。
+通知センターから消えても保持すること、バッジの有無・不明状態、日本語／英語の説明、連続確認、新着通知の猶予、消去応答中の競合など25項目を検証します。
+
+Windowsの通常のデスクトップで、ChatGPT／Codexアプリ起動中なら、次のExplorer統合テストも実行できます。最小化した検証用ウィンドウのバッジだけを一時的に表示・消去し、自動で終了します。ユーザーのChatGPT通知には触れません。
+
+```powershell
+dotnet run --project tests/TaskbarBadge.Integration -c Release
+```
 
 ## 構成
 
@@ -135,3 +149,5 @@ OpenAI・M5Stackの公式製品ではありません。
 - [Microsoft Bluetooth RFCOMM](https://learn.microsoft.com/en-us/windows/apps/develop/devices-sensors/send-or-receive-files-with-rfcomm)
 - [Microsoft Notification Listener](https://learn.microsoft.com/en-us/windows/uwp/design/shell/tiles-and-notifications/notification-listener)
 - [M5Stack ATOMの書き込み](https://docs.m5stack.com/en/arduino/m5atom/program)
+
+- [Microsoft SetOverlayIcon（アクセシビリティ説明）](https://learn.microsoft.com/en-us/windows/win32/api/shobjidl_core/nf-shobjidl_core-itaskbarlist3-setoverlayicon)

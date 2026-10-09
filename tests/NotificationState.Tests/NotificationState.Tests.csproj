@@ -7,5 +7,6 @@
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="../../windows/NotificationState.cs" Link="NotificationState.cs" />
+    <Compile Include="../../windows/BadgeState.cs" Link="BadgeState.cs" />
   </ItemGroup>
 </Project>

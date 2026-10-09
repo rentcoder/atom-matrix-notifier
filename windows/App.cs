@@ -2,7 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
-using System.Diagnostics;
+
 using System.Threading;
 using System.Threading.Tasks;
 using System.Runtime.InteropServices;
@@ -25,6 +25,7 @@ public record BluetoothChoice(string Id, string Name);
 
 public class Settings {
     public string DeviceId { get; set; } = "";
+    public string BadgeAppId { get; set; } = "";
     public string Apps { get; set; } = "ChatGPT|Codex";
     public string Codex { get; set; } = @"\bcodex\b|コーデックス";
     public string Dots { get; set; } = @"\bdots?\b|ドット";
@@ -58,7 +59,16 @@ public class MainWindow : Window {
     readonly DispatcherTimer timer = new() { Interval = TimeSpan.FromSeconds(1) };
     readonly HashSet<string> outbound = new(); // Explicit display tests only.
     readonly NotificationState notificationState = new();
-    readonly DispatcherTimer foregroundTimer = new() { Interval = TimeSpan.FromMilliseconds(500) };
+    readonly DispatcherTimer badgeTimer = new() { Interval = TimeSpan.FromSeconds(2) };
+    readonly TaskbarBadgeReader badgeReader;
+    readonly BadgeClearPolicy badgeClearPolicy = new();
+    readonly TextBlock badgeStatus = new() { Text = "バッジを確認しています…", TextWrapping = TextWrapping.Wrap };
+    BadgeReading badgeReading = new(BadgePresence.Unknown, "", "未取得");
+    Task<BadgeReading>? badgeProbe;
+    bool badgeBusy, badgeClearLogged;
+    string configuredBadgeAppId = "";
+    DateTimeOffset lastBadgePoll = DateTimeOffset.MinValue;
+    DateTimeOffset? lastNotificationUtc, lastBadgeRead;
     StreamSocket? socket;
     DataReader? reader;
     DataWriter? writer;
@@ -68,8 +78,8 @@ public class MainWindow : Window {
     UserNotificationListener? listener;
     Regex? appRule, codexRule, dotsRule;
     bool busy;
-    bool chatWasForeground;
-    string foregroundProcess = "";
+
+
     DateTimeOffset? lastPcAcknowledgement;
     int lastClearMask;
     string firmwareBeforeSync = "未取得";
@@ -86,6 +96,7 @@ public class MainWindow : Window {
     readonly string configPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "AtomNotifier", "settings.json");
 
     public MainWindow() {
+        badgeReader = new(Path.Combine(Path.GetDirectoryName(configPath)!, "badge-reader.json"));
         Title = "ATOM Matrix 通知ランプ — Bluetooth"; Width = 710; Height = 680;
         ShowInTaskbar = false;
         ShowActivated = false;
@@ -121,28 +132,28 @@ public class MainWindow : Window {
         var tests = new StackPanel { Orientation = Orientation.Horizontal };
         foreach (var channel in new[] { "CHAT", "CODEX", "DOTS" }) {
             string captured = channel;
-            AddButton(tests, $"{channel} テスト", () => { outbound.Add(captured); AddLog("テストをキューに追加: " + captured); });
+            AddButton(tests, $"{channel} テスト", () => { outbound.Add(captured); lastNotificationUtc = DateTimeOffset.UtcNow; badgeClearLogged = false; AddLog("テストをキューに追加: " + captured); });
         }
         panel.Children.Add(tests);
         AddButton(panel, "設定を保存（反映には再接続）", Save);
         AddButton(panel, "トレイに戻す", HideToTray);
-        panel.Children.Add(details); panel.Children.Add(state); panel.Children.Add(log);
-        panel.Children.Add(new TextBlock { Text = "省電力：20秒スリープ／新着を約4秒表示。通常20〜30秒程度で転送。\nスリープ中の短押し：再表示。表示中に再度短押し：確認済み。長押し1.5秒：全確認。\n通知本文はPC内の分類だけに使い、ATOMへは種類だけ送信します。\nWindows版ChatGPTが前面ならChatを全確認。次の起床時に消去同期。\nWindows通知そのものは削除しません。PC・ブリッジ稼働中に動作します。", TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 12, 0, 0) });
+        panel.Children.Add(details); panel.Children.Add(state); panel.Children.Add(badgeStatus); panel.Children.Add(log);
+        panel.Children.Add(new TextBlock { Text = "省電力：20秒スリープ／新着を約4秒表示。通常20〜30秒程度で転送。\nスリープ中の短押し：再表示。表示中に再度短押し：確認済み。長押し1.5秒：全確認。\n通知本文はPC内の分類だけに使い、ATOMへは種類だけ送信します。\nバッジが消えたら3種類を全確認。次の起床時に消去同期。\nWindows通知そのものは削除しません。PC・ブリッジ稼働中に動作します。", TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 12, 0, 0) });
         Load();
         timer.Tick += async (_, _) => await Tick();
-        foregroundTimer.Tick += (_, _) => AcknowledgeForegroundChat();
+        badgeTimer.Tick += async (_, _) => await PollBadge();
         Loaded += async (_, _) => {
             if (started) return;
             started = true;
             HideToTray();
-            foregroundTimer.Start();
+            badgeTimer.Start();
             await RefreshPorts(); await Connect();
         };
         StateChanged += (_, _) => { if (WindowState == WindowState.Minimized && started) HideToTray(); };
         Closing += (_, e) => { if (!exiting) { e.Cancel = true; HideToTray(); } };
         Application.Current.SessionEnding += (_, _) => exiting = true;
         Closed += (_, _) => {
-            timer.Stop(); foregroundTimer.Stop(); Disconnect();
+            timer.Stop(); badgeTimer.Stop(); Disconnect();
             tray.Visible = false;
             WriteOperationalStatus();
             tray.Dispose(); trayMenu.Dispose(); trayImage.Dispose();
@@ -178,33 +189,51 @@ public class MainWindow : Window {
     public void QueueDisplayTest() {
         foreach (string channel in new[] { "CHAT", "CODEX", "DOTS" })
             outbound.Add(channel);
+        lastNotificationUtc = DateTimeOffset.UtcNow; badgeClearLogged = false;
         AddLog("3種類の表示テストを追加しました。ATOMが起きるまで保持します。");
         WriteOperationalStatus();
-    }
-    [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
-    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr window, out uint processId);
-    void AcknowledgeForegroundChat() {
-        try {
-            GetWindowThreadProcessId(GetForegroundWindow(), out uint processId);
-            using var process = Process.GetProcessById((int)processId);
-            foregroundProcess = process.ProcessName;
-            bool isChat = string.Equals(foregroundProcess, "ChatGPT", StringComparison.OrdinalIgnoreCase);
-            if (isChat) {
-                bool changed = notificationState.DismissChannel("CHAT") | outbound.Remove("CHAT");
-                if (changed || !chatWasForeground) {
-                    lastPcAcknowledgement = DateTimeOffset.Now;
-                    AddLog("ChatGPTが前面：Chatを確認済みにしました。次の起床時にATOMへ反映します。");
-                    WriteOperationalStatus();
-                }
-            }
-            chatWasForeground = isChat;
-        } catch { chatWasForeground = false; }
     }
     void AcknowledgeChannel(string channel) {
         notificationState.DismissChannel(channel); outbound.Remove(channel);
         lastPcAcknowledgement = DateTimeOffset.Now;
         AddLog("PCで確認済み: " + channel + "。次の起床時にATOMへ反映します。");
         WriteOperationalStatus();
+    }
+    async Task PollBadge() {
+        if (exiting || badgeBusy || DateTimeOffset.UtcNow - lastBadgePoll < TimeSpan.FromSeconds(2)) return;
+        badgeBusy = true;
+        lastBadgePoll = DateTimeOffset.UtcNow;
+        try {
+            if (badgeProbe is { IsCompleted: false })
+                badgeReading = new(BadgePresence.Unknown, "", "前回のバッジ読み取りが応答待ちです");
+            else {
+                string appId = configuredBadgeAppId;
+                badgeProbe = Task.Run(() => badgeReader.Read(appId));
+                try { badgeReading = await badgeProbe.WaitAsync(TimeSpan.FromSeconds(3)); }
+                catch (TimeoutException) { badgeReading = new(BadgePresence.Unknown, "", "バッジ読み取りがタイムアウトしました"); }
+            }
+            if (exiting) return;
+            lastBadgeRead = DateTimeOffset.Now;
+            if (badgeReading.Presence != BadgePresence.Absent) badgeClearLogged = false;
+            if (badgeClearPolicy.Observe(badgeReading.Presence, DateTimeOffset.UtcNow, lastNotificationUtc)) {
+                foreach (string channel in NotificationState.Channels) notificationState.DismissChannel(channel);
+                outbound.Clear();
+                if (!badgeClearLogged) {
+                    badgeClearLogged = true;
+                    lastPcAcknowledgement = DateTimeOffset.Now;
+                    AddLog("バッジなしを連続確認：3種類を確認済みにしました。次の起床時に消去します。");
+                }
+            }
+            badgeStatus.Text = "未確認判定：" + badgeReading.Detail;
+            SetState(state.Text);
+        } finally { badgeBusy = false; }
+    }
+    async Task FlushClears() {
+        ClearRequest request = notificationState.CaptureClear();
+        if (request.Mask == 0) return;
+        if (!await Exchange("CLEAR " + request.Mask, "OK")) throw new IOException("バッジによる消去同期の受領確認なし");
+        lastClearMask = request.Mask;
+        notificationState.ConfirmClear(request);
     }
     static void AddButton(Panel p, string label, Action action) {
         var b = new Button { Content = label, Margin = new Thickness(4), Padding = new Thickness(8) };
@@ -235,13 +264,13 @@ public class MainWindow : Window {
         Settings s = new();
         try { if (File.Exists(configPath)) s = JsonSerializer.Deserialize<Settings>(File.ReadAllText(configPath)) ?? s; } catch { }
         apps.Text = s.Apps; codex.Text = s.Codex; dots.Text = s.Dots;
-        preferredDeviceId = s.DeviceId;
+        preferredDeviceId = s.DeviceId; configuredBadgeAppId = s.BadgeAppId.Trim();
     }
     void Save() {
         try {
             _ = MakeRegex(apps.Text); _ = MakeRegex(codex.Text); _ = MakeRegex(dots.Text);
             Directory.CreateDirectory(Path.GetDirectoryName(configPath)!);
-            File.WriteAllText(configPath, JsonSerializer.Serialize(new Settings { DeviceId = (ports.SelectedItem as BluetoothChoice)?.Id ?? preferredDeviceId, Apps = apps.Text, Codex = codex.Text, Dots = dots.Text }, new JsonSerializerOptions { WriteIndented = true }));
+            File.WriteAllText(configPath, JsonSerializer.Serialize(new Settings { DeviceId = (ports.SelectedItem as BluetoothChoice)?.Id ?? preferredDeviceId, BadgeAppId = configuredBadgeAppId, Apps = apps.Text, Codex = codex.Text, Dots = dots.Text }, new JsonSerializerOptions { WriteIndented = true }));
             AddLog("設定を保存しました。反映には再接続してください。");
         } catch (Exception e) { state.Text = "保存失敗: " + e.Message; }
     }
@@ -255,7 +284,7 @@ public class MainWindow : Window {
     }
     void SetState(string text) {
         state.Text = text;
-        string caption = timer.IsEnabled ? "省電力監視中（ATOMの起床待ち）" : text;
+        string caption = timer.IsEnabled ? "省電力監視中 / " + badgeReading.Detail : text;
         trayStatus.Text = caption;
         string tooltip = "ATOM 通知ブリッジ — " + caption;
         tray.Text = tooltip.Length <= 63 ? tooltip : tooltip[..60] + "…";
@@ -266,7 +295,7 @@ public class MainWindow : Window {
         try {
             Directory.CreateDirectory(Path.GetDirectoryName(configPath)!);
             File.WriteAllText(Path.Combine(Path.GetDirectoryName(configPath)!, "status.json"),
-                JsonSerializer.Serialize(new { Time = DateTimeOffset.Now, Message = state.Text, Connected = connected, Monitoring = timer.IsEnabled, Transport = "Bluetooth Classic SPP", PowerMode = "DeepSleep20s", PendingChannels = outbound.Concat(notificationState.QueuedChannels).Distinct().Count(), LastSuccessfulExchange = lastSuccessfulExchange, CompletedSleepCycles = completedSleepCycles, MessagesSent = messagesSent, FirmwarePowerStatus = firmwarePowerStatus, FirmwareBeforeSync = firmwareBeforeSync, PcClearMask = lastClearMask, LastPcAcknowledgement = lastPcAcknowledgement, ForegroundProcess = foregroundProcess, LastTransportError = lastTransportError, TrayVisible = tray.Visible, WindowVisible = IsVisible, InTaskbar = ShowInTaskbar, ProcessId = Environment.ProcessId }));
+                JsonSerializer.Serialize(new { Time = DateTimeOffset.Now, Message = state.Text, Connected = connected, Monitoring = timer.IsEnabled, Transport = "Bluetooth Classic SPP", PowerMode = "DeepSleep20s", PendingChannels = outbound.Concat(notificationState.QueuedChannels).Distinct().Count(), LastSuccessfulExchange = lastSuccessfulExchange, CompletedSleepCycles = completedSleepCycles, MessagesSent = messagesSent, FirmwarePowerStatus = firmwarePowerStatus, FirmwareBeforeSync = firmwareBeforeSync, PcClearMask = lastClearMask, LastPcAcknowledgement = lastPcAcknowledgement, BadgeState = badgeReading.Presence.ToString(), BadgeDetail = badgeReading.Detail, BadgeTargetAppId = badgeReading.AppId, BadgeLastRead = lastBadgeRead, PendingClearMask = notificationState.ClearMask, LastTransportError = lastTransportError, TrayVisible = tray.Visible, WindowVisible = IsVisible, InTaskbar = ShowInTaskbar, ProcessId = Environment.ProcessId }));
         } catch { }
     }
     void Disconnect() {
@@ -327,19 +356,14 @@ public class MainWindow : Window {
             firmwareBeforeSync = await ReadResponse("STATUS");
             // Refresh after connecting: a toast may have been read while the radio was asleep.
             await RefreshNotificationState();
-            lastClearMask = notificationState.ClearMask;
-            if (!await Exchange("CLEAR " + lastClearMask, "OK")) throw new IOException("確認済み同期の受領確認なし");
+            await FlushClears();
             foreach (string channel in outbound.Concat(notificationState.QueuedChannels).Distinct().ToArray()) {
                 if (!outbound.Contains(channel) && !notificationState.QueuedChannels.Contains(channel)) continue;
                 if (!await Exchange("N " + channel, "OK")) throw new IOException("通知の受領確認なし");
                 outbound.Remove(channel); notificationState.MarkSent(channel); messagesSent++;
             }
-            // A foreground change may occur during any Bluetooth await.
-            AcknowledgeForegroundChat();
-            if (notificationState.ClearMask != lastClearMask) {
-                lastClearMask = notificationState.ClearMask;
-                if (!await Exchange("CLEAR " + lastClearMask, "OK")) throw new IOException("確認済み同期の受領確認なし");
-            }
+            await PollBadge();
+            await FlushClears();
             firmwarePowerStatus = await ReadResponse("STATUS");
             if (!await Exchange("SLEEP", "SLEEPING 20")) throw new IOException("スリープの受領確認なし");
             lastSuccessfulExchange = DateTimeOffset.Now;
@@ -373,9 +397,11 @@ public class MainWindow : Window {
             snapshot[Key(n)] = dotsRule!.IsMatch(searchable) ? "DOTS" : codexRule!.IsMatch(searchable) ? "CODEX" : "CHAT";
             if (details.IsChecked == true) diagnostics[Key(n)] = " / " + app + " / " + binding?.GetTextElements().FirstOrDefault()?.Text;
         }
-        foreach (string key in notificationState.Observe(snapshot))
+        string[] added = notificationState.Observe(snapshot);
+        if (added.Length > 0) { lastNotificationUtc = DateTimeOffset.UtcNow; badgeClearLogged = false; }
+        foreach (string key in added)
             AddLog("通知受信: " + snapshot[key] + (diagnostics.TryGetValue(key, out string? text) ? text : ""));
-        AcknowledgeForegroundChat();
+        await PollBadge();
     }
     async Task Tick() {
         if (busy || listener == null) return;
