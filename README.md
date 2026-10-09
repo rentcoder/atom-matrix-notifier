@@ -73,6 +73,20 @@ Windows起動時に自動起動するには、`Win+R` → `shell:startup` を開
 
 同じ種類の通知はまとめます。Windows通知そのものは削除しません。
 
+## PCでの確認済み同期（v1.4）
+
+Windows版ChatGPTアプリを前面にすると、**Chatの保持をすべて確認済み**にします。会話ごとの既読判定ではないため、別の会話のChat通知も消えます。Codex・Dotsの保持はこの前面検出では消しません。
+
+ChatGPT内の既読状態を直接取得しているわけではありません。Windowsの前面ウィンドウが `ChatGPT` プロセスに属することを判定し、確認済みの代わりに使います。前面にしている間に届いたChat通知も確認済みになります。
+
+ブラウザー版ChatGPTの前面表示はこの検出の対象外です。
+
+Windows通知センターから消えた通知も追跡します。同じ種類の未確認通知がほかに残っている場合は、その種類の保持を消しません。送信待ちの間に確認・削除した通知は転送しません。Windows通知センターに残っていても、PCで確認済みとした既存通知から再点灯することはありません。新しい通知が届くと再び対象になります。
+
+ATOMが眠っている間の変更は次の起床時に反映します。通知領域の右クリック→「Chatを確認済みにする」「すべて確認済みにする」からも消去できます。Windows通知そのものを削除する操作は行いません。
+
+更新時はWindowsブリッジとATOMの両方を更新してください。v1.4のプロトコルは `CLEAR <mask>`（Chat=1、Codex=2、Dots=4）で指定した種類だけを消去します。PCから未確認フラグを毎回上書きしないため、ATOMのボタンで確認済みにした状態も勝手に復活しません。
+
 ## 通知の分類とデータ
 
 Windows通知アクセスで取得できる通知を分類します。ChatGPTやCodexからWindowsへ届かないイベントは取得できません。
@@ -91,7 +105,17 @@ PC側の未送信キューはメモリー上で保持します。ブリッジを
 
 実機ESP32-PICO-D4への書き込みとBluetooth通信、CPU80MHz・Modem Sleep有効、Deep Sleep復帰回数の増加、スリープをまたぐ3種類の未確認状態保持、PC側キューからの3種類の転送・受領確認を検証しました。
 
+v1.4ではWindows版ChatGPTの実際の前面検出と、次の同期でChatだけを消去してCodex・Dotsを保持する動作を実機の応答で確認しました。
+
 物理LEDの見え方、ボタンによる復帰・確認操作、個別の実際のChat・Codex・Dot通知はこの検証では直接観察していません。
+
+通知同期ロジックは以下で検証できます（追加のテストライブラリーは不要）。
+
+```powershell
+dotnet run --project tests/NotificationState.Tests -c Release
+```
+
+初回通知の扱い、同一種類の一部削除、前面相当の確認済み処理、残存通知による復活防止、新着通知による再開、スリープ中の送信待ち取り消しなど10項目を検証します。
 
 ## 構成
 
@@ -109,4 +133,5 @@ OpenAI・M5Stackの公式製品ではありません。
 - [Espressif Sleep Modes](https://docs.espressif.com/projects/esp-idf/en/v5.5.2/esp32/api-reference/system/sleep_modes.html)
 - [Espressif BluetoothSerial](https://docs.espressif.com/projects/arduino-esp32/en/latest/api/bluetooth.html)
 - [Microsoft Bluetooth RFCOMM](https://learn.microsoft.com/en-us/windows/apps/develop/devices-sensors/send-or-receive-files-with-rfcomm)
+- [Microsoft Notification Listener](https://learn.microsoft.com/en-us/windows/uwp/design/shell/tiles-and-notifications/notification-listener)
 - [M5Stack ATOMの書き込み](https://docs.m5stack.com/en/arduino/m5atom/program)

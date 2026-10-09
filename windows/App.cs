@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Diagnostics;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Runtime.InteropServices;
@@ -55,8 +56,9 @@ public class MainWindow : Window {
     readonly TextBox log = new() { IsReadOnly = true, AcceptsReturn = true, VerticalScrollBarVisibility = ScrollBarVisibility.Auto, Height = 240 };
     readonly CheckBox details = new() { Content = "分類確認用にアプリ名・タイトルを表示する（この画面内のみ）" };
     readonly DispatcherTimer timer = new() { Interval = TimeSpan.FromSeconds(1) };
-    readonly Queue<string> outbound = new();
-    HashSet<string> previous = new();
+    readonly HashSet<string> outbound = new(); // Explicit display tests only.
+    readonly NotificationState notificationState = new();
+    readonly DispatcherTimer foregroundTimer = new() { Interval = TimeSpan.FromMilliseconds(500) };
     StreamSocket? socket;
     DataReader? reader;
     DataWriter? writer;
@@ -65,7 +67,12 @@ public class MainWindow : Window {
     string preferredDeviceId = "";
     UserNotificationListener? listener;
     Regex? appRule, codexRule, dotsRule;
-    bool busy, initialized;
+    bool busy;
+    bool chatWasForeground;
+    string foregroundProcess = "";
+    DateTimeOffset? lastPcAcknowledgement;
+    int lastClearMask;
+    string firmwareBeforeSync = "未取得";
     DateTimeOffset nextConnectAttempt = DateTimeOffset.MinValue;
     DateTimeOffset? lastSuccessfulExchange;
     int completedSleepCycles, messagesSent;
@@ -91,6 +98,10 @@ public class MainWindow : Window {
         trayMenu.Items.Add("設定を開く", null, (_, _) => ShowSettings());
         trayMenu.Items.Add("Bluetooth再接続", null, async (_, _) => { if (busy) return; await RefreshPorts(); await Connect(); });
         trayMenu.Items.Add("通知表示テスト", null, (_, _) => QueueDisplayTest());
+        trayMenu.Items.Add("Chatを確認済みにする", null, (_, _) => AcknowledgeChannel("CHAT"));
+        trayMenu.Items.Add("すべて確認済みにする", null, (_, _) => {
+            foreach (string channel in NotificationState.Channels) AcknowledgeChannel(channel);
+        });
         trayMenu.Items.Add(new Forms.ToolStripSeparator());
         trayMenu.Items.Add("終了", null, (_, _) => ExitApp());
         tray = new Forms.NotifyIcon { Icon = trayImage, Text = "ATOM 通知ブリッジ — 接続を確認中", ContextMenuStrip = trayMenu, Visible = true };
@@ -110,26 +121,28 @@ public class MainWindow : Window {
         var tests = new StackPanel { Orientation = Orientation.Horizontal };
         foreach (var channel in new[] { "CHAT", "CODEX", "DOTS" }) {
             string captured = channel;
-            AddButton(tests, $"{channel} テスト", () => { outbound.Enqueue(captured); AddLog("テストをキューに追加: " + captured); });
+            AddButton(tests, $"{channel} テスト", () => { outbound.Add(captured); AddLog("テストをキューに追加: " + captured); });
         }
         panel.Children.Add(tests);
         AddButton(panel, "設定を保存（反映には再接続）", Save);
         AddButton(panel, "トレイに戻す", HideToTray);
         panel.Children.Add(details); panel.Children.Add(state); panel.Children.Add(log);
-        panel.Children.Add(new TextBlock { Text = "省電力：20秒スリープ／新着を約4秒表示。通常20〜30秒程度で転送。\nスリープ中の短押し：再表示。表示中に再度短押し：確認済み。長押し1.5秒：全確認。\n通知本文はPC内の分類だけに使い、ATOMへは種類だけ送信します。\nWindows通知そのものは削除しません。PC稼働中・このアプリ起動中に動作します。", TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 12, 0, 0) });
+        panel.Children.Add(new TextBlock { Text = "省電力：20秒スリープ／新着を約4秒表示。通常20〜30秒程度で転送。\nスリープ中の短押し：再表示。表示中に再度短押し：確認済み。長押し1.5秒：全確認。\n通知本文はPC内の分類だけに使い、ATOMへは種類だけ送信します。\nWindows版ChatGPTが前面ならChatを全確認。次の起床時に消去同期。\nWindows通知そのものは削除しません。PC・ブリッジ稼働中に動作します。", TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 12, 0, 0) });
         Load();
         timer.Tick += async (_, _) => await Tick();
+        foregroundTimer.Tick += (_, _) => AcknowledgeForegroundChat();
         Loaded += async (_, _) => {
             if (started) return;
             started = true;
             HideToTray();
+            foregroundTimer.Start();
             await RefreshPorts(); await Connect();
         };
         StateChanged += (_, _) => { if (WindowState == WindowState.Minimized && started) HideToTray(); };
         Closing += (_, e) => { if (!exiting) { e.Cancel = true; HideToTray(); } };
         Application.Current.SessionEnding += (_, _) => exiting = true;
         Closed += (_, _) => {
-            timer.Stop(); Disconnect();
+            timer.Stop(); foregroundTimer.Stop(); Disconnect();
             tray.Visible = false;
             WriteOperationalStatus();
             tray.Dispose(); trayMenu.Dispose(); trayImage.Dispose();
@@ -164,8 +177,33 @@ public class MainWindow : Window {
     }
     public void QueueDisplayTest() {
         foreach (string channel in new[] { "CHAT", "CODEX", "DOTS" })
-            if (!outbound.Contains(channel)) outbound.Enqueue(channel);
+            outbound.Add(channel);
         AddLog("3種類の表示テストを追加しました。ATOMが起きるまで保持します。");
+        WriteOperationalStatus();
+    }
+    [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr window, out uint processId);
+    void AcknowledgeForegroundChat() {
+        try {
+            GetWindowThreadProcessId(GetForegroundWindow(), out uint processId);
+            using var process = Process.GetProcessById((int)processId);
+            foregroundProcess = process.ProcessName;
+            bool isChat = string.Equals(foregroundProcess, "ChatGPT", StringComparison.OrdinalIgnoreCase);
+            if (isChat) {
+                bool changed = notificationState.DismissChannel("CHAT") | outbound.Remove("CHAT");
+                if (changed || !chatWasForeground) {
+                    lastPcAcknowledgement = DateTimeOffset.Now;
+                    AddLog("ChatGPTが前面：Chatを確認済みにしました。次の起床時にATOMへ反映します。");
+                    WriteOperationalStatus();
+                }
+            }
+            chatWasForeground = isChat;
+        } catch { chatWasForeground = false; }
+    }
+    void AcknowledgeChannel(string channel) {
+        notificationState.DismissChannel(channel); outbound.Remove(channel);
+        lastPcAcknowledgement = DateTimeOffset.Now;
+        AddLog("PCで確認済み: " + channel + "。次の起床時にATOMへ反映します。");
         WriteOperationalStatus();
     }
     static void AddButton(Panel p, string label, Action action) {
@@ -228,7 +266,7 @@ public class MainWindow : Window {
         try {
             Directory.CreateDirectory(Path.GetDirectoryName(configPath)!);
             File.WriteAllText(Path.Combine(Path.GetDirectoryName(configPath)!, "status.json"),
-                JsonSerializer.Serialize(new { Time = DateTimeOffset.Now, Message = state.Text, Connected = connected, Monitoring = timer.IsEnabled, Transport = "Bluetooth Classic SPP", PowerMode = "DeepSleep20s", PendingChannels = outbound.Count, LastSuccessfulExchange = lastSuccessfulExchange, CompletedSleepCycles = completedSleepCycles, MessagesSent = messagesSent, FirmwarePowerStatus = firmwarePowerStatus, LastTransportError = lastTransportError, TrayVisible = tray.Visible, WindowVisible = IsVisible, InTaskbar = ShowInTaskbar, ProcessId = Environment.ProcessId }));
+                JsonSerializer.Serialize(new { Time = DateTimeOffset.Now, Message = state.Text, Connected = connected, Monitoring = timer.IsEnabled, Transport = "Bluetooth Classic SPP", PowerMode = "DeepSleep20s", PendingChannels = outbound.Concat(notificationState.QueuedChannels).Distinct().Count(), LastSuccessfulExchange = lastSuccessfulExchange, CompletedSleepCycles = completedSleepCycles, MessagesSent = messagesSent, FirmwarePowerStatus = firmwarePowerStatus, FirmwareBeforeSync = firmwareBeforeSync, PcClearMask = lastClearMask, LastPcAcknowledgement = lastPcAcknowledgement, ForegroundProcess = foregroundProcess, LastTransportError = lastTransportError, TrayVisible = tray.Visible, WindowVisible = IsVisible, InTaskbar = ShowInTaskbar, ProcessId = Environment.ProcessId }));
         } catch { }
     }
     void Disconnect() {
@@ -263,11 +301,7 @@ public class MainWindow : Window {
             var access = await listener.RequestAccessAsync();
             if (access != UserNotificationListenerAccessStatus.Allowed)
                 throw new Exception("通知アクセスが許可されていません。Windows設定の通知アクセスと、Install.ps1での登録を確認してください。");
-            // Baseline only on first connection. On reconnect, new retained toasts are captured.
-            if (!initialized) {
-                previous = (await listener.GetNotificationsAsync(NotificationKinds.Toast)).Select(Key).ToHashSet();
-                initialized = true;
-            }
+            await RefreshNotificationState();
             Save(); nextConnectAttempt = DateTimeOffset.MinValue; timer.Start();
             SetState("省電力監視中。通知はATOMの起床時に転送します。");
             AddLog("省電力監視を開始しました。ATOMのスリープ中も通知を保持します。");
@@ -289,13 +323,24 @@ public class MainWindow : Window {
             reader = new DataReader(socket.InputStream) { InputStreamOptions = InputStreamOptions.Partial };
             writer = new DataWriter(socket.OutputStream);
             connected = true;
-            if (!await Exchange("PING", "PONG ATOM_NOTIFIER_BT_LP_V3")) throw new IOException("省電力版ファームウェアの応答ではありません");
-            firmwarePowerStatus = await ReadResponse("STATUS");
-            while (outbound.Count > 0) {
-                string channel = outbound.Peek();
+            if (!await Exchange("PING", "PONG ATOM_NOTIFIER_BT_LP_V4")) throw new IOException("省電力版ファームウェアの応答ではありません");
+            firmwareBeforeSync = await ReadResponse("STATUS");
+            // Refresh after connecting: a toast may have been read while the radio was asleep.
+            await RefreshNotificationState();
+            lastClearMask = notificationState.ClearMask;
+            if (!await Exchange("CLEAR " + lastClearMask, "OK")) throw new IOException("確認済み同期の受領確認なし");
+            foreach (string channel in outbound.Concat(notificationState.QueuedChannels).Distinct().ToArray()) {
+                if (!outbound.Contains(channel) && !notificationState.QueuedChannels.Contains(channel)) continue;
                 if (!await Exchange("N " + channel, "OK")) throw new IOException("通知の受領確認なし");
-                outbound.Dequeue(); messagesSent++;
+                outbound.Remove(channel); notificationState.MarkSent(channel); messagesSent++;
             }
+            // A foreground change may occur during any Bluetooth await.
+            AcknowledgeForegroundChat();
+            if (notificationState.ClearMask != lastClearMask) {
+                lastClearMask = notificationState.ClearMask;
+                if (!await Exchange("CLEAR " + lastClearMask, "OK")) throw new IOException("確認済み同期の受領確認なし");
+            }
+            firmwarePowerStatus = await ReadResponse("STATUS");
             if (!await Exchange("SLEEP", "SLEEPING 20")) throw new IOException("スリープの受領確認なし");
             lastSuccessfulExchange = DateTimeOffset.Now;
             completedSleepCycles++;
@@ -311,30 +356,32 @@ public class MainWindow : Window {
         }
     }
     static string Key(UserNotification n) => n.Id + ":" + n.CreationTime.UtcTicks;
+    async Task RefreshNotificationState() {
+        if (listener == null || listener.GetAccessStatus() != UserNotificationListenerAccessStatus.Allowed)
+            throw new InvalidOperationException("Windowsの通知アクセスが解除されました。");
+        var notifications = await listener.GetNotificationsAsync(NotificationKinds.Toast);
+        // Access revocation must not look like an empty notification center.
+        if (listener.GetAccessStatus() != UserNotificationListenerAccessStatus.Allowed)
+            throw new InvalidOperationException("Windowsの通知アクセスが解除されました。");
+        var snapshot = new Dictionary<string, string>();
+        var diagnostics = new Dictionary<string, string>();
+        foreach (var n in notifications) {
+            string app = n.AppInfo.DisplayInfo.DisplayName;
+            if (!appRule!.IsMatch(app)) continue;
+            var binding = n.Notification.Visual.GetBinding(KnownNotificationBindings.ToastGeneric);
+            string searchable = app + "\n" + string.Join("\n", binding?.GetTextElements().Select(t => t.Text) ?? Array.Empty<string>());
+            snapshot[Key(n)] = dotsRule!.IsMatch(searchable) ? "DOTS" : codexRule!.IsMatch(searchable) ? "CODEX" : "CHAT";
+            if (details.IsChecked == true) diagnostics[Key(n)] = " / " + app + " / " + binding?.GetTextElements().FirstOrDefault()?.Text;
+        }
+        foreach (string key in notificationState.Observe(snapshot))
+            AddLog("通知受信: " + snapshot[key] + (diagnostics.TryGetValue(key, out string? text) ? text : ""));
+        AcknowledgeForegroundChat();
+    }
     async Task Tick() {
         if (busy || listener == null) return;
         busy = true;
         try {
-            if (listener.GetAccessStatus() != UserNotificationListenerAccessStatus.Allowed)
-                throw new Exception("Windowsの通知アクセスが解除されました。");
-            var notifications = await listener.GetNotificationsAsync(NotificationKinds.Toast);
-            var current = new HashSet<string>();
-            foreach (var n in notifications.OrderBy(n => n.CreationTime)) {
-                string key = Key(n); current.Add(key);
-                if (previous.Contains(key)) continue;
-                try {
-                    string app = n.AppInfo.DisplayInfo.DisplayName;
-                    if (!appRule!.IsMatch(app)) continue;
-                    var binding = n.Notification.Visual.GetBinding(KnownNotificationBindings.ToastGeneric);
-                    var texts = binding?.GetTextElements().Select(t => t.Text).ToArray() ?? Array.Empty<string>();
-                    string searchable = app + "\n" + string.Join("\n", texts);
-                    string channel = dotsRule!.IsMatch(searchable) ? "DOTS" : codexRule!.IsMatch(searchable) ? "CODEX" : "CHAT";
-                    if (outbound.Count >= 100) { AddLog("キューが満杯です。新しい通知を破棄しました。"); continue; }
-                    if (!outbound.Contains(channel)) outbound.Enqueue(channel);
-                    AddLog("通知受信: " + channel + (details.IsChecked == true ? " / " + app + " / " + texts.FirstOrDefault() : ""));
-                } catch (Exception e) { AddLog("通知の分類失敗: " + e.Message); }
-            }
-            previous = current;
+            await RefreshNotificationState();
             await DeliverAndSleep();
         } catch (Exception e) {
             timer.Stop(); Disconnect();
@@ -342,4 +389,3 @@ public class MainWindow : Window {
         } finally { busy = false; }
     }
 }
-

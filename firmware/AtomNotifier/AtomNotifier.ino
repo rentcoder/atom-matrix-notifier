@@ -49,13 +49,21 @@ int nextPending(int after) {
 void command(const char* line) {
   if (strcmp(line, "PING") == 0) {
     lastHeartbeat = millis();
-    SerialBT.println("PONG ATOM_NOTIFIER_BT_LP_V3");
+    SerialBT.println("PONG ATOM_NOTIFIER_BT_LP_V4");
     return;
   }
   if (strcmp(line, "STATUS") == 0) {
     SerialBT.printf("CPU%u MODEM%u WAKE%lu PENDING%u\n", getCpuFrequencyMhz(),
       modemSleepEnabled, (unsigned long)wakeCount,
       (unsigned)(pending[0] + pending[1] + pending[2]));
+    return;
+  }
+  if (strncmp(line, "CLEAR ", 6) == 0 && line[6] >= '0' && line[6] <= '7' && line[7] == 0) {
+    uint8_t mask = line[6] - '0';
+    for (int i = 0; i < 3; ++i) if (mask & (1 << i)) pending[i] = false;
+    if (shown >= 0 && !pending[shown]) shown = nextPending(shown);
+    if (shown < 0) displayUntil = 0;
+    SerialBT.println("OK");
     return;
   }
   if (strcmp(line, "SLEEP") == 0) {
@@ -192,7 +200,7 @@ void setup() {
     Serial.println("Bluetooth startup failed");
   } else {
     modemSleepEnabled = esp_bt_sleep_enable() == ESP_OK;
-    Serial.printf("READY ATOM_NOTIFIER_BT_LP_V3 CPU%u MODEM%u WAKE%lu\n",
+    Serial.printf("READY ATOM_NOTIFIER_BT_LP_V4 CPU%u MODEM%u WAKE%lu\n",
       getCpuFrequencyMhz(), modemSleepEnabled, (unsigned long)wakeCount);
   }
   sleepDeadline = millis() + RECEIVE_WINDOW_MS;
